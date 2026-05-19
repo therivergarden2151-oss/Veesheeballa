@@ -1,0 +1,164 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+import torchaudio
+import torchaudio.transforms as T
+from torchvision import models
+from tqdm import tqdm
+import os
+import random
+import numpy as np
+
+# --- CONFIGURATION ---
+NUM_CLASSES = 7
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+TARGET_SAMPLE_RATE = 16000
+DURATION_SEC = 3  # (This is the time frame of audio we look at: test between 3sec-10sec range)
+N_MELS = 128
+BATCH_SIZE = 8    # Increased slightly for CNN efficiency
+LEARNING_RATE = 1e-4
+N_EPOCHS = 15     # CNNs usually need slightly more epochs than pre-trained Transformers
+
+# Data Paths
+TRAIN_DIR = r"C:\Users\Valued\Desktop\Dog Translator 2.0\Learning and Testing\Focus on Best Test\Learning"
+TEST_DIR = r"C:\Users\Valued\Desktop\Dog Translator 2.0\Learning and Testing\Focus on Best Test\testing"
+
+# --- DATASET CLASS ---
+class DogSpectrogramDataset(Dataset):
+    def __init__(self, data_dir, is_test=False):
+        self.data_dir = data_dir
+        self.is_test = is_test
+        self.samples = []
+        
+        # Mapping identical to your previous script
+        self.label_map = {"0": 0, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6}
+        self.test_label_map = {
+            "veesheeballa": 0, "otter": 1, "window": 2, "squirrel": 3, 
+            "pantera": 4, "groundhog": 5, "armadillo": 6
+        }
+        
+        # Audio Transforms
+        self.melspec = T.MelSpectrogram(
+            sample_rate=TARGET_SAMPLE_RATE,
+            n_fft=1024,
+            hop_length=512,
+            n_mels=N_MELS
+        )
+        self.db_transform = T.AmplitudeToDB()
+        
+        # Augmentation (SpecAugment) - Helps handle variations in "Ground-Hog" spacing
+        self.freq_mask = T.FrequencyMasking(freq_mask_param=15)
+        self.time_mask = T.TimeMasking(time_mask_param=35)
+
+        self._load_data()
+
+    def _load_data(self):
+        if self.is_test:
+            for file in os.listdir(self.data_dir):
+                if file.endswith(".wav"):
+                    label_name = file.split("_")[0].lower()
+                    label = self.test_label_map.get(label_name)
+                    if label is not None:
+                        self.samples.append((os.path.join(self.data_dir, file), label))
+        else:
+            for label_name in os.listdir(self.data_dir):
+                label_dir = os.path.join(self.data_dir, label_name)
+                if os.path.isdir(label_dir) and label_name in self.label_map:
+                    label = self.label_map[label_name]
+                    for file in os.listdir(label_dir):
+                        if file.endswith(".wav"):
+                            self.samples.append((os.path.join(label_dir, file), label))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        filepath, label = self.samples[idx]
+        waveform, sr = torchaudio.load(filepath)
+
+        # Standardize: Mono and Resample
+        if waveform.shape[0] > 1: waveform = waveform.mean(dim=0).unsqueeze(0)
+        if sr != TARGET_SAMPLE_RATE:
+            resampler = T.Resample(sr, TARGET_SAMPLE_RATE)
+            waveform = resampler(waveform)
+
+        # Pad or Truncate to exactly 3 seconds
+        num_frames = TARGET_SAMPLE_RATE * DURATION_SEC
+        if waveform.shape[1] < num_frames:
+            waveform = torch.cat([waveform, torch.zeros((1, num_frames - waveform.shape[1]))], dim=1)
+        else:
+            waveform = waveform[:, :num_frames]
+
+        # Convert to Spectrogram
+        spec = self.melspec(waveform)
+        spec = self.db_transform(spec)
+
+        # Apply Augmentation only during training
+        if not self.is_test:
+            spec = self.freq_mask(spec)
+            spec = self.time_mask(spec)
+
+        # ResNet expects 3 channels (RGB). We repeat our grayscale spec across 3 channels.
+        spec = spec.repeat(3, 1, 1) 
+
+        return spec, label, filepath
+
+# --- MODEL DEFINITION (ResNet-18) ---
+def get_model(num_classes):
+    model = models.resnet18(pretrained=True)
+    # Adjust the last layer to your number of dog words
+    num_ftrs = model.fc.in_features
+    model.fc = nn.Linear(num_ftrs, num_classes)
+    return model.to(DEVICE)
+
+# --- TRAINING & EVALUATION FUNCTIONS ---
+def train_one_epoch(model, loader, criterion, optimizer):
+    model.train()
+    total_loss = 0
+    for specs, labels, _ in tqdm(loader, desc="Training"):
+        specs, labels = specs.to(DEVICE), labels.to(DEVICE)
+        optimizer.zero_grad()
+        outputs = model(specs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+def evaluate(model, loader, index_to_name):
+    model.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for specs, labels, filepaths in loader:
+            specs, labels = specs.to(DEVICE), labels.to(DEVICE)
+            outputs = model(specs)
+            preds = torch.argmax(outputs, dim=1)
+            
+            for i in range(len(labels)):
+                total += 1
+                if preds[i] == labels[i]:
+                    correct += 1
+                else:
+                    print(f"❌ Missed: {os.path.basename(filepaths[i])} | Actual: {index_to_name[labels[i].item()]} | Pred: {index_to_name[preds[i].item()]}")
+
+    print(f"\n🎯 Accuracy: {100 * correct / total:.2f}%")
+
+# --- EXECUTION ---
+if __name__ == "__main__":
+    train_dataset = DogSpectrogramDataset(TRAIN_DIR, is_test=False)
+    test_dataset = DogSpectrogramDataset(TEST_DIR, is_test=True)
+    
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    
+    index_to_name = {v: k for k, v in test_dataset.test_label_map.items()}
+    
+    model = get_model(NUM_CLASSES)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+
+    for epoch in range(1, N_EPOCHS + 1):
+        loss = train_one_epoch(model, train_loader, criterion, optimizer)
+        print(f"Epoch {epoch} Loss: {loss:.4f}")
+    
+    evaluate(model, test_loader, index_to_name)
